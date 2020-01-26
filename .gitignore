@@ -1,0 +1,7 @@
+*.swp
+*.o
+*.so
+/build/
+/dist/
+/gpiod.egg-info/
+/venv/
