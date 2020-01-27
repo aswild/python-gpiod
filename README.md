@@ -20,6 +20,7 @@ Building is the usual process for Python setuptools packages, e.g.
 
 ```
 python3 setup.py build
+python3 setup.py build_ext -i
 python3 setup.py install
 ```
 

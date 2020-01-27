@@ -11,35 +11,40 @@ if sys.version_info < (3,):
 
 from setuptools import Extension, setup
 
-GPIOD_VERSION = '1.4.1'
-
+gpiod_version = '1.4.1'
+gpiod_headers = ['gpiod/gpiod.h']
 gpiod_extension = Extension(
-    'gpiod',
-    [
+    name='gpiod',
+    sources=[
         # gpiod Python module
         'gpiod/gpiodmodule.c',
         # libgpiod C API
         'gpiod/core.c',
-        #'gpiod/ctxless.c', # not needed by python bindings
         'gpiod/helpers.c',
         'gpiod/iter.c',
         'gpiod/misc.c',
+        #'gpiod/ctxless.c', # not needed by python bindings
     ],
     include_dirs=['gpiod'],
-    define_macros=[('_GNU_SOURCE', None), ('GPIOD_VERSION_STR', '"%s"'%GPIOD_VERSION)],
+    define_macros=[('_GNU_SOURCE', None), ('GPIOD_VERSION_STR', '"%s"'%gpiod_version)],
+    depends=gpiod_headers,
 )
+
+with open('README.md', 'r') as fp:
+    readme_content = fp.read()
 
 setup(
     name='gpiod',
     ext_modules=[gpiod_extension],
 
-    version=GPIOD_VERSION,
-    description='libgpiod Python bindings',
-    author='Bartosz Golaszewski',
-    author_email='bartekgola@gmail.com',
+    version=gpiod_version,
+    description='Standalone libgpiod Python bindings',
+    long_description=readme_content,
+    long_description_content_type='text/markdown',
     maintainer='Allen Wild',
     maintainer_email='allenwild93@gmail.com',
-
+    url='https://github.com/aswild/python-gpiod',
+    python_requires='>=3',
     classifiers=[
         'License :: OSI Approved :: GNU Lesser General Public License v2 or later (LGPLv2+)',
         'Programming Language :: Python :: 3',
