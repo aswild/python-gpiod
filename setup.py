@@ -5,6 +5,10 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 # Copyright (C) 2020 Allen Wild <allenwild93@gmail.com>
 
+import sys
+if sys.version_info < (3,):
+    sys.exit('Error: this module requires Python 3')
+
 from setuptools import Extension, setup
 
 GPIOD_VERSION = '1.4.1'
@@ -21,6 +25,7 @@ gpiod_extension = Extension(
         'gpiod/iter.c',
         'gpiod/misc.c',
     ],
+    include_dirs=['gpiod'],
     define_macros=[('_GNU_SOURCE', None), ('GPIOD_VERSION_STR', '"%s"'%GPIOD_VERSION)],
 )
 
