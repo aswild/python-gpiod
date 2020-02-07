@@ -11,7 +11,7 @@ if sys.version_info < (3,):
 
 from setuptools import Extension, setup
 
-gpiod_version = '1.4.1'
+gpiod_version = '1.5'
 gpiod_headers = ['gpiod/gpiod.h']
 gpiod_extension = Extension(
     name='gpiod',
