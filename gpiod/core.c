@@ -34,14 +34,27 @@ struct line_fd_handle {
 
 struct gpiod_line {
 	unsigned int offset;
-	int direction;
-	int active_state;
-	bool used;
-	bool open_source;
-	bool open_drain;
 
+	/* The direction of the GPIO line. */
+	int direction;
+
+	/* The active-state configuration. */
+	int active_state;
+
+	/* The logical value last written to the line. */
+	int output_value;
+
+	/* The GPIOLINE_FLAGs returned by GPIO_GET_LINEINFO_IOCTL. */
+	__u32 info_flags;
+
+	/* The GPIOD_LINE_REQUEST_FLAGs provided to request the line. */
+	__u32 req_flags;
+
+	/*
+	 * Indicator of LINE_FREE, LINE_REQUESTED_VALUES or
+	 * LINE_REQUESTED_EVENTS.
+	 */
 	int state;
-	bool up_to_date;
 
 	struct gpiod_chip *chip;
 	struct line_fd_handle *fd_handle;
@@ -110,7 +123,7 @@ static bool is_gpiochip_cdev(const char *path)
 
 	/*
 	 * Make sure the major and minor numbers of the character device
-	 * correspond with the ones in the dev attribute in sysfs.
+	 * correspond to the ones in the dev attribute in sysfs.
 	 */
 	snprintf(devstr, sizeof(devstr), "%u:%u",
 		 major(statbuf.st_rdev), minor(statbuf.st_rdev));
@@ -120,12 +133,14 @@ static bool is_gpiochip_cdev(const char *path)
 		goto out_free_sysfsp;
 
 	memset(sysfsdev, 0, sizeof(sysfsdev));
-	rd = read(fd, sysfsdev, strlen(devstr));
+	rd = read(fd, sysfsdev, sizeof(sysfsdev) - 1);
 	close(fd);
 	if (rd < 0)
 		goto out_free_sysfsp;
 
-	if (strcmp(sysfsdev, devstr) != 0) {
+	rd--; /* Ignore trailing newline. */
+	if ((size_t)rd != strlen(devstr) ||
+	    strncmp(sysfsdev, devstr, rd) != 0) {
 		errno = ENODEV;
 		goto out_free_sysfsp;
 	}
@@ -318,15 +333,6 @@ static int line_get_fd(struct gpiod_line *line)
 	return line->fd_handle->fd;
 }
 
-static void line_maybe_update(struct gpiod_line *line)
-{
-	int rv;
-
-	rv = gpiod_line_update(line);
-	if (rv < 0)
-		line->up_to_date = false;
-}
-
 struct gpiod_chip *gpiod_line_get_chip(struct gpiod_line *line)
 {
 	return line->chip;
@@ -357,24 +363,36 @@ int gpiod_line_active_state(struct gpiod_line *line)
 	return line->active_state;
 }
 
+int gpiod_line_bias(struct gpiod_line *line)
+{
+	if (line->info_flags & GPIOLINE_FLAG_BIAS_DISABLE)
+		return GPIOD_LINE_BIAS_DISABLE;
+	if (line->info_flags & GPIOLINE_FLAG_BIAS_PULL_UP)
+		return GPIOD_LINE_BIAS_PULL_UP;
+	if (line->info_flags & GPIOLINE_FLAG_BIAS_PULL_DOWN)
+		return GPIOD_LINE_BIAS_PULL_DOWN;
+
+	return GPIOD_LINE_BIAS_AS_IS;
+}
+
 bool gpiod_line_is_used(struct gpiod_line *line)
 {
-	return line->used;
+	return line->info_flags & GPIOLINE_FLAG_KERNEL;
 }
 
 bool gpiod_line_is_open_drain(struct gpiod_line *line)
 {
-	return line->open_drain;
+	return line->info_flags & GPIOLINE_FLAG_OPEN_DRAIN;
 }
 
 bool gpiod_line_is_open_source(struct gpiod_line *line)
 {
-	return line->open_source;
+	return line->info_flags & GPIOLINE_FLAG_OPEN_SOURCE;
 }
 
-bool gpiod_line_needs_update(struct gpiod_line *line)
+bool gpiod_line_needs_update(struct gpiod_line *line GPIOD_UNUSED)
 {
-	return !line->up_to_date;
+	return false;
 }
 
 int gpiod_line_update(struct gpiod_line *line)
@@ -396,14 +414,10 @@ int gpiod_line_update(struct gpiod_line *line)
 						? GPIOD_LINE_ACTIVE_STATE_LOW
 						: GPIOD_LINE_ACTIVE_STATE_HIGH;
 
-	line->used = info.flags & GPIOLINE_FLAG_KERNEL;
-	line->open_drain = info.flags & GPIOLINE_FLAG_OPEN_DRAIN;
-	line->open_source = info.flags & GPIOLINE_FLAG_OPEN_SOURCE;
+	line->info_flags = info.flags;
 
 	strncpy(line->name, info.name, sizeof(line->name));
 	strncpy(line->consumer, info.consumer, sizeof(line->consumer));
-
-	line->up_to_date = true;
 
 	return 0;
 }
@@ -447,6 +461,20 @@ static bool line_bulk_all_requested(struct gpiod_line_bulk *bulk)
 	return true;
 }
 
+static bool line_bulk_all_requested_values(struct gpiod_line_bulk *bulk)
+{
+	struct gpiod_line *line, **lineptr;
+
+	gpiod_line_bulk_foreach_line(bulk, line, lineptr) {
+		if (line->state != LINE_REQUESTED_VALUES) {
+			errno = EPERM;
+			return false;
+		}
+	}
+
+	return true;
+}
+
 static bool line_bulk_all_free(struct gpiod_line_bulk *bulk)
 {
 	struct gpiod_line *line, **lineptr;
@@ -461,11 +489,52 @@ static bool line_bulk_all_free(struct gpiod_line_bulk *bulk)
 	return true;
 }
 
+static bool line_request_direction_is_valid(int direction)
+{
+	if ((direction == GPIOD_LINE_REQUEST_DIRECTION_AS_IS) ||
+	    (direction == GPIOD_LINE_REQUEST_DIRECTION_INPUT) ||
+	    (direction == GPIOD_LINE_REQUEST_DIRECTION_OUTPUT))
+		return true;
+
+	errno = EINVAL;
+	return false;
+}
+
+static __u32 line_request_direction_to_gpio_handleflag(int direction)
+{
+	if (direction == GPIOD_LINE_REQUEST_DIRECTION_INPUT)
+		return GPIOHANDLE_REQUEST_INPUT;
+	if (direction == GPIOD_LINE_REQUEST_DIRECTION_OUTPUT)
+		return GPIOHANDLE_REQUEST_OUTPUT;
+
+	return 0;
+}
+
+static __u32 line_request_flag_to_gpio_handleflag(int flags)
+{
+	int hflags = 0;
+
+	if (flags & GPIOD_LINE_REQUEST_FLAG_OPEN_DRAIN)
+		hflags |= GPIOHANDLE_REQUEST_OPEN_DRAIN;
+	if (flags & GPIOD_LINE_REQUEST_FLAG_OPEN_SOURCE)
+		hflags |= GPIOHANDLE_REQUEST_OPEN_SOURCE;
+	if (flags & GPIOD_LINE_REQUEST_FLAG_ACTIVE_LOW)
+		hflags |= GPIOHANDLE_REQUEST_ACTIVE_LOW;
+	if (flags & GPIOD_LINE_REQUEST_FLAG_BIAS_DISABLE)
+		hflags |= GPIOHANDLE_REQUEST_BIAS_DISABLE;
+	if (flags & GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_DOWN)
+		hflags |= GPIOHANDLE_REQUEST_BIAS_PULL_DOWN;
+	if (flags & GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP)
+		hflags |= GPIOHANDLE_REQUEST_BIAS_PULL_UP;
+
+	return hflags;
+}
+
 static int line_request_values(struct gpiod_line_bulk *bulk,
 			       const struct gpiod_line_request_config *config,
 			       const int *default_vals)
 {
-	struct gpiod_line *line, **lineptr;
+	struct gpiod_line *line;
 	struct line_fd_handle *line_fd;
 	struct gpiohandle_request req;
 	unsigned int i;
@@ -486,19 +555,14 @@ static int line_request_values(struct gpiod_line_bulk *bulk,
 
 	memset(&req, 0, sizeof(req));
 
-	if (config->flags & GPIOD_LINE_REQUEST_FLAG_OPEN_DRAIN)
-		req.flags |= GPIOHANDLE_REQUEST_OPEN_DRAIN;
-	if (config->flags & GPIOD_LINE_REQUEST_FLAG_OPEN_SOURCE)
-		req.flags |= GPIOHANDLE_REQUEST_OPEN_SOURCE;
-	if (config->flags & GPIOD_LINE_REQUEST_FLAG_ACTIVE_LOW)
-		req.flags |= GPIOHANDLE_REQUEST_ACTIVE_LOW;
+	req.lines = gpiod_line_bulk_num_lines(bulk);
+	req.flags = line_request_flag_to_gpio_handleflag(config->flags);
 
 	if (config->request_type == GPIOD_LINE_REQUEST_DIRECTION_INPUT)
 		req.flags |= GPIOHANDLE_REQUEST_INPUT;
 	else if (config->request_type == GPIOD_LINE_REQUEST_DIRECTION_OUTPUT)
 		req.flags |= GPIOHANDLE_REQUEST_OUTPUT;
 
-	req.lines = gpiod_line_bulk_num_lines(bulk);
 
 	gpiod_line_bulk_foreach_line_off(bulk, line, i) {
 		req.lineoffsets[i] = gpiod_line_offset(line);
@@ -523,10 +587,19 @@ static int line_request_values(struct gpiod_line_bulk *bulk,
 	if (!line_fd)
 		return -1;
 
-	gpiod_line_bulk_foreach_line(bulk, line, lineptr) {
+	gpiod_line_bulk_foreach_line_off(bulk, line, i) {
 		line->state = LINE_REQUESTED_VALUES;
+		line->req_flags = config->flags;
+		if (config->request_type ==
+				GPIOD_LINE_REQUEST_DIRECTION_OUTPUT)
+			line->output_value = req.default_values[i];
 		line_set_fd(line, line_fd);
-		line_maybe_update(line);
+
+		rv = gpiod_line_update(line);
+		if (rv) {
+			gpiod_line_release_bulk(bulk);
+			return rv;
+		}
 	}
 
 	return 0;
@@ -546,14 +619,8 @@ static int line_request_event_single(struct gpiod_line *line,
 			sizeof(req.consumer_label) - 1);
 
 	req.lineoffset = gpiod_line_offset(line);
+	req.handleflags = line_request_flag_to_gpio_handleflag(config->flags);
 	req.handleflags |= GPIOHANDLE_REQUEST_INPUT;
-
-	if (config->flags & GPIOD_LINE_REQUEST_FLAG_OPEN_DRAIN)
-		req.handleflags |= GPIOHANDLE_REQUEST_OPEN_DRAIN;
-	if (config->flags & GPIOD_LINE_REQUEST_FLAG_OPEN_SOURCE)
-		req.handleflags |= GPIOHANDLE_REQUEST_OPEN_SOURCE;
-	if (config->flags & GPIOD_LINE_REQUEST_FLAG_ACTIVE_LOW)
-		req.handleflags |= GPIOHANDLE_REQUEST_ACTIVE_LOW;
 
 	if (config->request_type == GPIOD_LINE_REQUEST_EVENT_RISING_EDGE)
 		req.eventflags |= GPIOEVENT_REQUEST_RISING_EDGE;
@@ -571,8 +638,14 @@ static int line_request_event_single(struct gpiod_line *line,
 		return -1;
 
 	line->state = LINE_REQUESTED_EVENTS;
+	line->req_flags = config->flags;
 	line_set_fd(line, line_fd);
-	line_maybe_update(line);
+
+	rv = gpiod_line_update(line);
+	if (rv) {
+		gpiod_line_release(line);
+		return rv;
+	}
 
 	return 0;
 }
@@ -737,8 +810,10 @@ int gpiod_line_set_value_bulk(struct gpiod_line_bulk *bulk, const int *values)
 
 	memset(&data, 0, sizeof(data));
 
-	for (i = 0; i < gpiod_line_bulk_num_lines(bulk); i++)
-		data.values[i] = (uint8_t)!!values[i];
+	if (values) {
+		for (i = 0; i < gpiod_line_bulk_num_lines(bulk); i++)
+			data.values[i] = (uint8_t)!!values[i];
+	}
 
 	line = gpiod_line_bulk_get_line(bulk, 0);
 	fd = line_get_fd(line);
@@ -747,7 +822,129 @@ int gpiod_line_set_value_bulk(struct gpiod_line_bulk *bulk, const int *values)
 	if (rv < 0)
 		return -1;
 
+	gpiod_line_bulk_foreach_line_off(bulk, line, i)
+		line->output_value = data.values[i];
+
 	return 0;
+}
+
+int gpiod_line_set_config(struct gpiod_line *line, int direction,
+			  int flags, int value)
+{
+	struct gpiod_line_bulk bulk;
+
+	gpiod_line_bulk_init(&bulk);
+	gpiod_line_bulk_add(&bulk, line);
+
+	return gpiod_line_set_config_bulk(&bulk, direction, flags, &value);
+}
+
+int gpiod_line_set_config_bulk(struct gpiod_line_bulk *bulk,
+			       int direction, int flags,
+			       const int *values)
+{
+	struct gpiohandle_config hcfg;
+	struct gpiod_line *line;
+	unsigned int i;
+	int rv, fd;
+
+	if (!line_bulk_same_chip(bulk) ||
+	    !line_bulk_all_requested_values(bulk))
+		return -1;
+
+	if (!line_request_direction_is_valid(direction))
+		return -1;
+
+	memset(&hcfg, 0, sizeof(hcfg));
+
+	hcfg.flags = line_request_flag_to_gpio_handleflag(flags);
+	hcfg.flags |= line_request_direction_to_gpio_handleflag(direction);
+	if (direction == GPIOD_LINE_REQUEST_DIRECTION_OUTPUT && values) {
+		for (i = 0; i < gpiod_line_bulk_num_lines(bulk); i++)
+			hcfg.default_values[i] = (uint8_t)!!values[i];
+	}
+
+	line = gpiod_line_bulk_get_line(bulk, 0);
+	fd = line_get_fd(line);
+
+	rv = ioctl(fd, GPIOHANDLE_SET_CONFIG_IOCTL, &hcfg);
+	if (rv < 0)
+		return -1;
+
+	gpiod_line_bulk_foreach_line_off(bulk, line, i) {
+		line->req_flags = flags;
+		if (direction == GPIOD_LINE_REQUEST_DIRECTION_OUTPUT)
+			line->output_value = hcfg.default_values[i];
+
+		rv = gpiod_line_update(line);
+		if (rv < 0)
+			return rv;
+	}
+	return 0;
+}
+
+int gpiod_line_set_flags(struct gpiod_line *line, int flags)
+{
+	struct gpiod_line_bulk bulk;
+
+	gpiod_line_bulk_init(&bulk);
+	gpiod_line_bulk_add(&bulk, line);
+
+	return gpiod_line_set_flags_bulk(&bulk, flags);
+}
+
+int gpiod_line_set_flags_bulk(struct gpiod_line_bulk *bulk, int flags)
+{
+	struct gpiod_line *line;
+	int values[GPIOD_LINE_BULK_MAX_LINES];
+	unsigned int i;
+	int direction;
+
+	line = gpiod_line_bulk_get_line(bulk, 0);
+	if (line->direction == GPIOD_LINE_DIRECTION_OUTPUT) {
+		gpiod_line_bulk_foreach_line_off(bulk, line, i)
+			values[i] = line->output_value;
+
+		direction = GPIOD_LINE_REQUEST_DIRECTION_OUTPUT;
+	} else {
+		direction = GPIOD_LINE_REQUEST_DIRECTION_INPUT;
+	}
+
+	return gpiod_line_set_config_bulk(bulk, direction,
+					  flags, values);
+}
+
+int gpiod_line_set_direction_input(struct gpiod_line *line)
+{
+	return gpiod_line_set_config(line, GPIOD_LINE_REQUEST_DIRECTION_INPUT,
+				     line->req_flags, 0);
+}
+
+int gpiod_line_set_direction_input_bulk(struct gpiod_line_bulk *bulk)
+{
+	struct gpiod_line *line;
+
+	line = gpiod_line_bulk_get_line(bulk, 0);
+	return gpiod_line_set_config_bulk(bulk,
+					  GPIOD_LINE_REQUEST_DIRECTION_INPUT,
+					  line->req_flags, NULL);
+}
+
+int gpiod_line_set_direction_output(struct gpiod_line *line, int value)
+{
+	return gpiod_line_set_config(line, GPIOD_LINE_REQUEST_DIRECTION_OUTPUT,
+				     line->req_flags, value);
+}
+
+int gpiod_line_set_direction_output_bulk(struct gpiod_line_bulk *bulk,
+					 const int *values)
+{
+	struct gpiod_line *line;
+
+	line = gpiod_line_bulk_get_line(bulk, 0);
+	return gpiod_line_set_config_bulk(bulk,
+					  GPIOD_LINE_REQUEST_DIRECTION_OUTPUT,
+					  line->req_flags, values);
 }
 
 int gpiod_line_event_wait(struct gpiod_line *line,
@@ -813,16 +1010,26 @@ int gpiod_line_event_wait_bulk(struct gpiod_line_bulk *bulk,
 int gpiod_line_event_read(struct gpiod_line *line,
 			  struct gpiod_line_event *event)
 {
+	int ret;
+
+	ret = gpiod_line_event_read_multiple(line, event, 1);
+	if (ret < 0)
+		return -1;
+
+	return 0;
+}
+
+int gpiod_line_event_read_multiple(struct gpiod_line *line,
+				   struct gpiod_line_event *events,
+				   unsigned int num_events)
+{
 	int fd;
 
-	if (line->state != LINE_REQUESTED_EVENTS) {
-		errno = EPERM;
+	fd = gpiod_line_event_get_fd(line);
+	if (fd < 0)
 		return -1;
-	}
 
-	fd = line_get_fd(line);
-
-	return gpiod_line_event_read_fd(fd, event);
+	return gpiod_line_event_read_fd_multiple(fd, events, num_events);
 }
 
 int gpiod_line_event_get_fd(struct gpiod_line *line)
@@ -837,25 +1044,51 @@ int gpiod_line_event_get_fd(struct gpiod_line *line)
 
 int gpiod_line_event_read_fd(int fd, struct gpiod_line_event *event)
 {
-	struct gpioevent_data evdata;
+	int ret;
+
+	ret = gpiod_line_event_read_fd_multiple(fd, event, 1);
+	if (ret < 0)
+		return -1;
+
+	return 0;
+}
+
+int gpiod_line_event_read_fd_multiple(int fd, struct gpiod_line_event *events,
+				      unsigned int num_events)
+{
+	/*
+	 * 16 is the maximum number of events the kernel can store in the FIFO
+	 * so we can allocate the buffer on the stack.
+	 */
+	struct gpioevent_data evdata[16], *curr;
+	struct gpiod_line_event *event;
+	unsigned int events_read, i;
 	ssize_t rd;
 
-	memset(&evdata, 0, sizeof(evdata));
+	memset(evdata, 0, sizeof(evdata));
 
-	rd = read(fd, &evdata, sizeof(evdata));
+	rd = read(fd, evdata, sizeof(evdata));
 	if (rd < 0) {
 		return -1;
-	} else if (rd != sizeof(evdata)) {
+	} else if ((unsigned int)rd < sizeof(*evdata)) {
 		errno = EIO;
 		return -1;
 	}
 
-	event->event_type = evdata.id == GPIOEVENT_EVENT_RISING_EDGE
-						? GPIOD_LINE_EVENT_RISING_EDGE
-						: GPIOD_LINE_EVENT_FALLING_EDGE;
+	events_read = rd / sizeof(*evdata);
+	if (events_read < num_events)
+		num_events = events_read;
 
-	event->ts.tv_sec = evdata.timestamp / 1000000000ULL;
-	event->ts.tv_nsec = evdata.timestamp % 1000000000ULL;
+	for (i = 0; i < num_events; i++) {
+		curr = &evdata[i];
+		event = &events[i];
 
-	return 0;
+		event->event_type = curr->id == GPIOEVENT_EVENT_RISING_EDGE
+					? GPIOD_LINE_EVENT_RISING_EDGE
+					: GPIOD_LINE_EVENT_FALLING_EDGE;
+		event->ts.tv_sec = curr->timestamp / 1000000000ULL;
+		event->ts.tv_nsec = curr->timestamp % 1000000000ULL;
+	}
+
+	return i;
 }
